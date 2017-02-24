@@ -1,16 +1,51 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
+	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/client"
 	flags "github.com/jessevdk/go-flags"
 )
 
 var rand uint32
+
+type Options struct {
+	Basesrc      string `short:"b" long:"basesrc" description:"base source directory" required:"true" group:"required"`
+	Cmd          string `short:"c" long:"cmd" description:"CMD for container"`
+	Cname        string `long:"cname" description:"container name"`
+	Gid          int    `long:"gid " description:"GID in container"`
+	Gname        string `long:"gname" description:"group name" default:"deployer"`
+	ImageId      string `long:"imageid" description:"docker image id"`
+	InstallJson  string `short:"j" long:"json" description:"install_json.json" required:"true" group:"required"`
+	NoproxyHosts string `long:"noproxy" description:"no proxy hosts"`
+	Privilege    bool   `long:"priviledge" description:"run container in priviledged mode"`
+	Root         bool   `long:"root" description:"run container as root"`
+	Tag          string `long:"tag" description:"image tag" default:"latest"`
+	Uid          int    `long:"uid" description:"UID in container"`
+	Uname        string `long:"uname" description:"user name" default:"deployer"`
+	Project      string `short:"p" long:"project" description:"project type" required:"true" group:"required"`
+	Workdir      string `short:"w" long:"workdir" description:"working directory"`
+	DockerApi    string `long:"apiversion" description:"docker client api version" default:"1.24"`
+}
+
+type Project struct {
+	Options
+	DockerClient struct {
+		Ctx    *context.Context
+		Client *client.Client
+	}
+	ImageRepository string
+	Image           types.ImageSummary
+}
 
 var project = [3]string{"konrad", "higgs", "racdb"}
 
@@ -103,7 +138,7 @@ func nextSuffix() string {
 func getTempDir() (name string) {
 	nconflict := 0
 	for i := 0; i < 10000; i++ {
-		name = nextSuffix()
+		name = "cc_" + nextSuffix()
 		_, err := os.Stat(name)
 		if os.IsExist(err) {
 			if nconflict++; nconflict > 10 {
@@ -116,28 +151,8 @@ func getTempDir() (name string) {
 	return
 }
 
-func init() {
-	fmt.Println("in init")
-}
-
-func optParser() {
-	var opts struct {
-		Basesrc      string `short:"b" long:"basesrc" description:"base source directory" required:"true" group:"required"`
-		Cmd          string `short:"c" long:"cmd" description:"CMD for container"`
-		Cname        string `long:"cname" description:"container name"`
-		Gid          int    `long:"gid " description:"GID in container"`
-		Gname        string `long:"gname" description:"group name" default:"deployer"`
-		ImageId      string `long:"imageid" description:"docker image id"`
-		InstallJson  string `short:"j" long:"json" description:"install_json.json" required:"true" group:"required"`
-		NoproxyHosts string `long:"noproxy" description:"no proxy hosts"`
-		Privilege    bool   `long:"priviledge" description:"run container in priviledged mode"`
-		Root         bool   `long:"root" description:"run container as root"`
-		Tag          string `long:"tag" description:"image tag" default:"latest"`
-		Uid          int    `long:"uid" description:"UID in container"`
-		Uname        string `long:"uname" description:"user name" default:"deployer"`
-		Project      string `short:"p" long:"project" description:"project type" required:"true" group:"required"`
-		Workdir      string `short:"w" long:"workdir" description:"working directory"`
-	}
+func optParser() *Options {
+	var opts Options
 
 	if _, err := flags.Parse(&opts); err != nil {
 		if flagsErr, ok := err.(*flags.Error); ok && flagsErr.Type == flags.ErrHelp {
@@ -153,7 +168,7 @@ func optParser() {
 
 	if len(opts.Cname) == 0 {
 		t := time.Now()
-		opts.Cname = t.Format(time.RFC3339)
+		opts.Cname = "deployer_" + t.Format(time.RFC3339)
 	}
 
 	if opts.Gid == 0 {
@@ -171,11 +186,82 @@ func optParser() {
 	if len(opts.Workdir) == 0 {
 		opts.Workdir = getTempDir()
 	}
+	return &opts
+}
 
-	fmt.Println(opts.Gid)
-	fmt.Println(opts.Workdir)
+func (p *Project) createDockerClient() {
+	// setup docker client api
+	os.Setenv("DOCKER_API_VERSION", p.DockerApi)
+
+	ctx := context.Background()
+	cli, err := client.NewEnvClient()
+	if err != nil {
+		panic(err)
+	}
+
+	p.DockerClient.Ctx = &ctx
+	p.DockerClient.Client = cli
+}
+
+func (p *Project) getImageId() {
+	cli := p.DockerClient.Client
+	ctx := *p.DockerClient.Ctx
+	ilist, err := cli.ImageList(ctx, types.ImageListOptions{})
+	if err != nil {
+		panic(err)
+	}
+
+	for _, image := range ilist {
+		for _, name := range image.RepoTags {
+			tagTmp := strings.Split(name, ":")
+			fmt.Println(p.ImageRepository)
+			if strings.Contains(tagTmp[0], p.ImageRepository) {
+				if strings.Contains(tagTmp[1], p.Tag) {
+					p.Image = image
+				}
+			}
+		}
+	}
+}
+
+func (p *Project) createContainer() {
+	//cli := p.DockerClient.Client
+	//ctx := *p.DockerClient.Ctx
+	//cli.ContainerCreate()
+	fmt.Println(p.Image)
+}
+
+func (p *Project) createTmpDir() {
+	currentPath, _ := os.Getwd()
+	workingPath := filepath.Join(currentPath, p.Workdir)
+	p.Workdir = workingPath
+	for _, v := range subDirs {
+		os.MkdirAll(filepath.Join(workingPath, v), os.FileMode(0755))
+	}
+}
+
+func (p *Project) prepare(opts *Options) {
+	oValue := reflect.ValueOf(*opts)
+	pValue := reflect.ValueOf(p).Elem()
+	pOvalue := pValue.Field(0)
+	for i := 0; i < pOvalue.NumField(); i++ {
+		f := pOvalue.Field(i)
+		f.Set(reflect.Value(oValue.Field(i)))
+	}
+	// setup image repository default name
+	p.ImageRepository = imageRepository[p.Project]
+}
+
+func (p *Project) run() {
+	p.createTmpDir()
+	p.createDockerClient()
+	p.getImageId()
+	p.createContainer()
 }
 
 func main() {
-	optParser()
+	var opts = optParser()
+	var project Project
+	project.prepare(opts)
+	project.run()
 }
