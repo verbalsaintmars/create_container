@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/user"
@@ -22,13 +23,13 @@ var rand uint32
 
 type Options struct {
 	Basesrc      string `short:"b" long:"basesrc" description:"base source directory" required:"true" group:"required"`
-	Cmd          string `short:"c" long:"cmd" description:"CMD for container"`
+	Cmd          string `short:"c" long:"cmd" description:"CMD for container" default:"tail -f /dev/null"`
 	Cname        string `long:"cname" description:"container name"`
 	Gid          int    `long:"gid " description:"GID in container"`
 	Gname        string `long:"gname" description:"group name" default:"deployer"`
 	ImageId      string `long:"imageid" description:"docker image id"`
 	InstallJson  string `short:"j" long:"json" description:"install_json.json" required:"true" group:"required"`
-	NoproxyHosts string `long:"noproxy" description:"no proxy hosts"`
+	NoproxyHosts string `long:"noproxy" description:"no proxy hosts" default:"localhost,127.0.0.1"`
 	Privilege    bool   `long:"priviledge" description:"run container in priviledged mode"`
 	Root         bool   `long:"root" description:"run container as root"`
 	Tag          string `long:"tag" description:"image tag" default:"latest"`
@@ -59,7 +60,7 @@ var home = map[string]string{
 	"racdb":  `/home/shinto/host`}
 
 var shell = map[string]string{
-	"zsh":  `/bin/zsh`, // I like zsh better.
+	"zsh":  `/bin/zsh`,
 	"bash": `/bin/bash`,
 	"sh":   `/bin/sh`}
 
@@ -80,14 +81,10 @@ var imageRepository = map[string]string{
 
 var subDirs = map[string]string{"log": "log", "src": "src"}
 
-var defaultCmd = `tail -f /dev/null`
-
-var noProxyHosts = "localhost,127.0.0.1"
-
 var repoBaseUrl = `http://artifactory-slc.oraclecorp.com/artifactory/opc-delivery-release`
 
 //"dummy.us.oracle.com"
-var logstashUrl = "dummy.us.oracle.com"
+var logstashUrl = `dummy.us.oracle.com`
 
 var logstashPort = 4242
 
@@ -115,10 +112,6 @@ func optParser() *Options {
 		}
 	}
 
-	if len(opts.Cmd) == 0 {
-		opts.Cmd = defaultCmd
-	}
-
 	if len(opts.Cname) == 0 {
 		t := time.Now()
 		opts.Cname = "deployer_" + t.Format("Jan02Mon3456")
@@ -132,10 +125,6 @@ func optParser() *Options {
 		opts.Uid = getUserInfo(uid).(int)
 	}
 
-	if len(opts.NoproxyHosts) == 0 {
-		opts.NoproxyHosts = noProxyHosts
-	}
-
 	if len(opts.Workdir) == 0 {
 		opts.Workdir = getTempDir()
 	}
@@ -143,6 +132,12 @@ func optParser() *Options {
 }
 
 // --- Tools ---
+
+func extractClient(p *Project) (cli *client.Client, ctx *context.Context) {
+	cli = p.DockerClient.Client
+	ctx = p.DockerClient.Ctx
+	return
+}
 func getUserInfo(t int) interface{} {
 	user, err := user.Current()
 
@@ -197,9 +192,8 @@ func extractImageId(id string) string {
 }
 
 func (p *Project) copyFileFromContainer(from, to string, hook func() string) {
-	cli := p.DockerClient.Client
-	ctx := *p.DockerClient.Ctx
-	fromIo, stat, err := cli.CopyFromContainer(ctx, p.Container.ID, from)
+	cli, ctx := extractClient(p)
+	fromIo, stat, err := cli.CopyFromContainer(*ctx, p.Container.ID, from)
 	check(err, "Copy file "+from+" from container "+p.Container.ID+" failed.")
 
 	srcInfo := archive.CopyInfo{
@@ -218,9 +212,8 @@ func (p *Project) copyFileFromContainer(from, to string, hook func() string) {
 }
 
 func (p *Project) inspectContainerFile(path string) bool {
-	cli := p.DockerClient.Client
-	ctx := *p.DockerClient.Ctx
-	_, err := cli.ContainerStatPath(ctx, p.Container.ID, path)
+	cli, ctx := extractClient(p)
+	_, err := cli.ContainerStatPath(*ctx, p.Container.ID, path)
 	if err != nil {
 		return false
 	}
@@ -228,13 +221,26 @@ func (p *Project) inspectContainerFile(path string) bool {
 }
 
 func (p *Project) checkShell() {
+	// prefer zsh first
+	shellPriority := []string{"zsh", "bash", "sh"}
+	availableShell := make(map[string]bool)
+
 	for k, v := range shell {
 		if p.inspectContainerFile(v) {
-			p.Shell = k
-			return
+			availableShell[k] = true
 		}
 	}
-	panic("No known shell in container available.")
+
+	if len(availableShell) != 0 {
+		for _, s := range shellPriority {
+			_, ok := availableShell[s]
+			if ok {
+				p.Shell = s
+				return
+			}
+		}
+	}
+	panic("No proper shell in container available.")
 }
 
 // ---End of tools---
@@ -252,9 +258,8 @@ func (p *Project) createDockerClient() {
 }
 
 func (p *Project) getImageId() {
-	cli := p.DockerClient.Client
-	ctx := *p.DockerClient.Ctx
-	ilist, err := cli.ImageList(ctx, types.ImageListOptions{})
+	cli, ctx := extractClient(p)
+	ilist, err := cli.ImageList(*ctx, types.ImageListOptions{})
 	check(err, "Get docker image list error.")
 
 	for _, image := range ilist {
@@ -268,7 +273,6 @@ func (p *Project) getImageId() {
 			if strings.Contains(tagTmp[0], p.ImageRepository) {
 				if strings.Contains(tagTmp[1], p.Tag) {
 					p.Image = image
-					fmt.Println("debug: in getImageId")
 				}
 			}
 		}
@@ -276,19 +280,31 @@ func (p *Project) getImageId() {
 }
 
 // Prepare Config for creating the container
-func (p *Project) prepareConfig() *container.Config {
+func (p *Project) prepareConfig(init bool) *container.Config {
 	var config container.Config
 	config.Image = extractImageId(p.Image.ID)
-	config.Entrypoint = []string{p.Cmd}
+	config.Entrypoint = strings.Split(p.Cmd, " ")
+
+	if init {
+		return &config
+	}
+
+	envStr := make([]string, 4)
+
+	if p.Root {
+		envStr = append(envStr, "C_FORCE_ROOT=1")
+	}
+	envStr = append(envStr, "no_proxy="+p.NoproxyHosts)
+	config.Env = envStr
+	fmt.Println(config.Env)
 	return &config
 }
 
-func (p *Project) createContainer() {
-	cli := p.DockerClient.Client
-	ctx := *p.DockerClient.Ctx
-	config := p.prepareConfig()
+func (p *Project) createContainer(init bool) {
+	cli, ctx := extractClient(p)
+	config := p.prepareConfig(init)
 
-	if body, err := cli.ContainerCreate(ctx, config, nil, nil, p.Cname); err != nil {
+	if body, err := cli.ContainerCreate(*ctx, config, nil, nil, p.Cname); err != nil {
 		fmt.Println("Create container failed with error: " + err.Error())
 		panic("Create Container failed")
 	} else {
@@ -298,13 +314,10 @@ func (p *Project) createContainer() {
 }
 
 func (p *Project) removeContainer() {
-	cli := p.DockerClient.Client
-	ctx := *p.DockerClient.Ctx
+	cli, ctx := extractClient(p)
 	var removeConfig types.ContainerRemoveOptions = types.ContainerRemoveOptions{false, false, true}
-	if err := cli.ContainerRemove(ctx, p.Container.ID, removeConfig); err != nil {
-		fmt.Println("Remove container ID: " + p.Container.ID + " failed")
-		panic("Remove container failed")
-	}
+	err := cli.ContainerRemove(*ctx, p.Container.ID, removeConfig)
+	check(err, "Remove container ID: "+p.Container.ID+" failed")
 }
 
 func (p *Project) createTmpDir() {
@@ -322,15 +335,42 @@ func (p *Project) rewriteUidGid() {
 	hooks := map[string]func() string{
 		"passwd": func() string {
 			//"{user}:x:{uid}:{gid}::{home}:{shell}"
-			return p.Uname + ":x:" + strconv.Itoa(p.Uid) + ":" + strconv.Itoa(p.Gid) + "::" + home[p.Project] + ":" + shell[p.Shell]
+			return p.Uname + ":x:" + strconv.Itoa(p.Uid) + ":" + strconv.Itoa(p.Gid) + "::" + home[p.Project] + ":" + shell[p.Shell] + "\n"
 		},
 		"group": func() string {
 			//"{group}:x:{gid}:"
-			return p.Gname + ":x:" + strconv.Itoa(p.Gid) + ":"
+			return p.Gname + ":x:" + strconv.Itoa(p.Gid) + ":" + "\n"
 		}}
 	for k, v := range pgfiles {
 		p.copyFileFromContainer(v, k, hooks[k])
 	}
+}
+
+func (p *Project) touchRepoconfigJson() {
+	type (
+		Repository struct {
+			Repo_base_url string `json:"repo_base_url"`
+		}
+		Logstash struct {
+			Host string `json:"host"`
+			Port int    `json:"port"`
+		}
+		RepoJson struct {
+			Repo Repository `json:"repository"`
+			Log  Logstash   `json:"logstash"`
+		}
+	)
+
+	rj := &RepoJson{
+		Repo: Repository{Repo_base_url: repoBaseUrl},
+		Log:  Logstash{Host: logstashUrl, Port: logstashPort}}
+	mrj, err := json.Marshal(rj)
+	check(err, "Marshal json file failed.")
+	fd, err := os.Create("repoconfig.json")
+	check(err, "Create repoconfig.json failed.")
+	_, err = fd.Write(mrj)
+	check(err, "Write to repoconfig.json error.")
+	defer fd.Close()
 }
 
 func (p *Project) prepare(opts *Options) {
@@ -353,9 +393,12 @@ func (p *Project) run() {
 	p.createTmpDir()
 	p.createDockerClient()
 	p.getImageId()
-	p.createContainer()
+	p.createContainer(true)
 	p.checkShell()
 	p.rewriteUidGid()
+	p.removeContainer()
+	p.touchRepoconfigJson()
+	p.createContainer(false)
 	fmt.Println(p.Shell)
 }
 
