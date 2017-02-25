@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/archive"
 	flags "github.com/jessevdk/go-flags"
 )
 
@@ -32,7 +34,7 @@ type Options struct {
 	Tag          string `long:"tag" description:"image tag" default:"latest"`
 	Uid          int    `long:"uid" description:"UID in container"`
 	Uname        string `long:"uname" description:"user name" default:"deployer"`
-	Project      string `short:"p" long:"project" description:"project type" required:"true" group:"required"`
+	Project      string `short:"p" long:"project" description:"project type" required:"true" group:"required" choice:"higgs" choice:"konrad" choice:"racdb"`
 	Workdir      string `short:"w" long:"workdir" description:"working directory"`
 	DockerApi    string `long:"apiversion" description:"docker client api version" default:"1.24"`
 }
@@ -45,6 +47,8 @@ type Project struct {
 	}
 	ImageRepository string
 	Image           types.ImageSummary
+	Container       container.ContainerCreateCreatedBody
+	Shell           string
 }
 
 var project = [3]string{"konrad", "higgs", "racdb"}
@@ -55,8 +59,13 @@ var home = map[string]string{
 	"racdb":  `/home/shinto/host`}
 
 var shell = map[string]string{
+	"zsh":  `/bin/zsh`, // I like zsh better.
 	"bash": `/bin/bash`,
-	"zsh":  `/bin/zsh`}
+	"sh":   `/bin/sh`}
+
+var pgfiles = map[string]string{
+	"passwd": `/etc/passwd`,
+	"group":  `/etc/group`}
 
 var srcPath = map[string]string{
 	"konrad": `compute-konrad-deployer/deployer`,
@@ -65,26 +74,15 @@ var srcPath = map[string]string{
 
 var imageRepository = map[string]string{
 	"konrad": fmt.Sprintf("compute-deployer_dev_%s", getUserInfo(name)),
-	"higgs":  fmt.Sprintf("compute-deployer_dev_%s", getUserInfo(name)),
-	"racdb":  fmt.Sprintf("compute-deployer_dev_%s", getUserInfo(name))}
+	//"higgs":  fmt.Sprintf("compute-deployer_dev_%s", getUserInfo(name)),
+	"higgs": `verbalsaint/o_opengrok`,
+	"racdb": fmt.Sprintf("compute-deployer_dev_%s", getUserInfo(name))}
 
 var subDirs = map[string]string{"log": "log", "src": "src"}
 
 var defaultCmd = `tail -f /dev/null`
 
 var noProxyHosts = "localhost,127.0.0.1"
-
-//"{user}:x:{uid}:{gid}::{home}:{shell}"
-var passwdFmt = "%s:x:%s:%s::%s:%s"
-
-//"{group}:x:{gid}:"
-var groupFmt = "%s:x:%s:"
-
-//":{UID}:{GID}:"
-var passwdRegex = ":%s:%s:"
-
-//":{GID}:"
-var groupRegex = ":%s:"
 
 var repoBaseUrl = `http://artifactory-slc.oraclecorp.com/artifactory/opc-delivery-release`
 
@@ -99,13 +97,56 @@ const (
 	gid
 )
 
-func getUserInfo(t int) interface{} {
-	user, ok := user.Current()
-
-	if ok != nil {
-		fmt.Println(ok)
-		panic("Can't get current user name.")
+func check(e error, msg string) {
+	if e != nil {
+		fmt.Println(msg)
+		panic(e)
 	}
+}
+
+func optParser() *Options {
+	var opts Options
+
+	if _, err := flags.Parse(&opts); err != nil {
+		if flagsErr, ok := err.(*flags.Error); ok && flagsErr.Type == flags.ErrHelp {
+			os.Exit(0)
+		} else {
+			os.Exit(1)
+		}
+	}
+
+	if len(opts.Cmd) == 0 {
+		opts.Cmd = defaultCmd
+	}
+
+	if len(opts.Cname) == 0 {
+		t := time.Now()
+		opts.Cname = "deployer_" + t.Format("Jan02Mon3456")
+	}
+
+	if opts.Gid == 0 {
+		opts.Gid = getUserInfo(gid).(int)
+	}
+
+	if opts.Uid == 0 {
+		opts.Uid = getUserInfo(uid).(int)
+	}
+
+	if len(opts.NoproxyHosts) == 0 {
+		opts.NoproxyHosts = noProxyHosts
+	}
+
+	if len(opts.Workdir) == 0 {
+		opts.Workdir = getTempDir()
+	}
+	return &opts
+}
+
+// --- Tools ---
+func getUserInfo(t int) interface{} {
+	user, err := user.Current()
+
+	check(err, "Can't get current user name.")
 
 	switch t {
 	case name:
@@ -151,43 +192,52 @@ func getTempDir() (name string) {
 	return
 }
 
-func optParser() *Options {
-	var opts Options
+func extractImageId(id string) string {
+	return strings.Split(id, ":")[1]
+}
 
-	if _, err := flags.Parse(&opts); err != nil {
-		if flagsErr, ok := err.(*flags.Error); ok && flagsErr.Type == flags.ErrHelp {
-			os.Exit(0)
-		} else {
-			os.Exit(1)
+func (p *Project) copyFileFromContainer(from, to string, hook func() string) {
+	cli := p.DockerClient.Client
+	ctx := *p.DockerClient.Ctx
+	fromIo, stat, err := cli.CopyFromContainer(ctx, p.Container.ID, from)
+	check(err, "Copy file "+from+" from container "+p.Container.ID+" failed.")
+
+	srcInfo := archive.CopyInfo{
+		Path:       from,
+		Exists:     true,
+		IsDir:      stat.Mode.IsDir(),
+		RebaseName: "",
+	}
+	// untar and copy
+	archive.CopyTo(fromIo, srcInfo, to)
+	// write uid/gid info
+	fd, err := os.OpenFile(to, os.O_APPEND|os.O_WRONLY, 0644)
+	fd.WriteString(hook())
+	defer fromIo.Close()
+	defer fd.Close()
+}
+
+func (p *Project) inspectContainerFile(path string) bool {
+	cli := p.DockerClient.Client
+	ctx := *p.DockerClient.Ctx
+	_, err := cli.ContainerStatPath(ctx, p.Container.ID, path)
+	if err != nil {
+		return false
+	}
+	return true
+}
+
+func (p *Project) checkShell() {
+	for k, v := range shell {
+		if p.inspectContainerFile(v) {
+			p.Shell = k
+			return
 		}
 	}
-
-	if len(opts.Cmd) == 0 {
-		opts.Cmd = defaultCmd
-	}
-
-	if len(opts.Cname) == 0 {
-		t := time.Now()
-		opts.Cname = "deployer_" + t.Format(time.RFC3339)
-	}
-
-	if opts.Gid == 0 {
-		opts.Gid = getUserInfo(gid).(int)
-	}
-
-	if opts.Uid == 0 {
-		opts.Uid = getUserInfo(uid).(int)
-	}
-
-	if len(opts.NoproxyHosts) == 0 {
-		opts.NoproxyHosts = noProxyHosts
-	}
-
-	if len(opts.Workdir) == 0 {
-		opts.Workdir = getTempDir()
-	}
-	return &opts
+	panic("No known shell in container available.")
 }
+
+// ---End of tools---
 
 func (p *Project) createDockerClient() {
 	// setup docker client api
@@ -195,9 +245,7 @@ func (p *Project) createDockerClient() {
 
 	ctx := context.Background()
 	cli, err := client.NewEnvClient()
-	if err != nil {
-		panic(err)
-	}
+	check(err, "Create docker client error.")
 
 	p.DockerClient.Ctx = &ctx
 	p.DockerClient.Client = cli
@@ -207,28 +255,56 @@ func (p *Project) getImageId() {
 	cli := p.DockerClient.Client
 	ctx := *p.DockerClient.Ctx
 	ilist, err := cli.ImageList(ctx, types.ImageListOptions{})
-	if err != nil {
-		panic(err)
-	}
+	check(err, "Get docker image list error.")
 
 	for _, image := range ilist {
+		// if docker image id provided, honor image id
+		if strings.Contains(image.ID, p.ImageRepository) {
+			p.Image = image
+			return
+		}
 		for _, name := range image.RepoTags {
 			tagTmp := strings.Split(name, ":")
-			fmt.Println(p.ImageRepository)
 			if strings.Contains(tagTmp[0], p.ImageRepository) {
 				if strings.Contains(tagTmp[1], p.Tag) {
 					p.Image = image
+					fmt.Println("debug: in getImageId")
 				}
 			}
 		}
 	}
 }
 
+// Prepare Config for creating the container
+func (p *Project) prepareConfig() *container.Config {
+	var config container.Config
+	config.Image = extractImageId(p.Image.ID)
+	config.Entrypoint = []string{p.Cmd}
+	return &config
+}
+
 func (p *Project) createContainer() {
-	//cli := p.DockerClient.Client
-	//ctx := *p.DockerClient.Ctx
-	//cli.ContainerCreate()
-	fmt.Println(p.Image)
+	cli := p.DockerClient.Client
+	ctx := *p.DockerClient.Ctx
+	config := p.prepareConfig()
+
+	if body, err := cli.ContainerCreate(ctx, config, nil, nil, p.Cname); err != nil {
+		fmt.Println("Create container failed with error: " + err.Error())
+		panic("Create Container failed")
+	} else {
+		p.Container = body
+	}
+
+}
+
+func (p *Project) removeContainer() {
+	cli := p.DockerClient.Client
+	ctx := *p.DockerClient.Ctx
+	var removeConfig types.ContainerRemoveOptions = types.ContainerRemoveOptions{false, false, true}
+	if err := cli.ContainerRemove(ctx, p.Container.ID, removeConfig); err != nil {
+		fmt.Println("Remove container ID: " + p.Container.ID + " failed")
+		panic("Remove container failed")
+	}
 }
 
 func (p *Project) createTmpDir() {
@@ -237,6 +313,23 @@ func (p *Project) createTmpDir() {
 	p.Workdir = workingPath
 	for _, v := range subDirs {
 		os.MkdirAll(filepath.Join(workingPath, v), os.FileMode(0755))
+	}
+	// Change to workdir
+	os.Chdir(p.Workdir)
+}
+
+func (p *Project) rewriteUidGid() {
+	hooks := map[string]func() string{
+		"passwd": func() string {
+			//"{user}:x:{uid}:{gid}::{home}:{shell}"
+			return p.Uname + ":x:" + strconv.Itoa(p.Uid) + ":" + strconv.Itoa(p.Gid) + "::" + home[p.Project] + ":" + shell[p.Shell]
+		},
+		"group": func() string {
+			//"{group}:x:{gid}:"
+			return p.Gname + ":x:" + strconv.Itoa(p.Gid) + ":"
+		}}
+	for k, v := range pgfiles {
+		p.copyFileFromContainer(v, k, hooks[k])
 	}
 }
 
@@ -249,7 +342,11 @@ func (p *Project) prepare(opts *Options) {
 		f.Set(reflect.Value(oValue.Field(i)))
 	}
 	// setup image repository default name
-	p.ImageRepository = imageRepository[p.Project]
+	if len(p.ImageId) != 0 {
+		p.ImageRepository = p.ImageId
+	} else {
+		p.ImageRepository = imageRepository[p.Project]
+	}
 }
 
 func (p *Project) run() {
@@ -257,6 +354,9 @@ func (p *Project) run() {
 	p.createDockerClient()
 	p.getImageId()
 	p.createContainer()
+	p.checkShell()
+	p.rewriteUidGid()
+	fmt.Println(p.Shell)
 }
 
 func main() {
