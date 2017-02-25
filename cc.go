@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/archive"
 	flags "github.com/jessevdk/go-flags"
@@ -22,7 +24,7 @@ import (
 var rand uint32
 
 type Options struct {
-	Basesrc      string `short:"b" long:"basesrc" description:"base source directory" required:"true" group:"required"`
+	BaseDir      string `short:"b" long:"basedir" description:"base source directory" required:"true" group:"required"`
 	Cmd          string `short:"c" long:"cmd" description:"CMD for container" default:"tail -f /dev/null"`
 	Cname        string `long:"cname" description:"container name"`
 	Gid          int    `long:"gid " description:"GID in container"`
@@ -48,8 +50,9 @@ type Project struct {
 	}
 	ImageRepository string
 	Image           types.ImageSummary
-	Container       container.ContainerCreateCreatedBody
-	Shell           string
+	Container       container.ContainerCreateCreatedBody // set in createContainer()
+	Shell           string                               // set in checkShell()
+	SourceDir       string                               // set in setSourceDir()
 }
 
 var project = [3]string{"konrad", "higgs", "racdb"}
@@ -75,9 +78,8 @@ var srcPath = map[string]string{
 
 var imageRepository = map[string]string{
 	"konrad": fmt.Sprintf("compute-deployer_dev_%s", getUserInfo(name)),
-	//"higgs":  fmt.Sprintf("compute-deployer_dev_%s", getUserInfo(name)),
-	"higgs": `verbalsaint/o_opengrok`,
-	"racdb": fmt.Sprintf("compute-deployer_dev_%s", getUserInfo(name))}
+	"higgs":  fmt.Sprintf("compute-deployer_dev_%s", getUserInfo(name)),
+	"racdb":  fmt.Sprintf("compute-deployer_dev_%s", getUserInfo(name))}
 
 var subDirs = map[string]string{"log": "log", "src": "src"}
 
@@ -126,8 +128,16 @@ func optParser() *Options {
 	}
 
 	if len(opts.Workdir) == 0 {
-		opts.Workdir = getTempDir()
+		currentPath, _ := os.Getwd()
+		workingPath := filepath.Join(currentPath, getTempDir())
+		opts.Workdir = workingPath
+	} else {
+		opts.Workdir = filepath.Join(opts.Workdir)
 	}
+
+	opts.BaseDir, _ = filepath.Abs(opts.BaseDir)
+	opts.InstallJson, _ = filepath.Abs(opts.InstallJson)
+
 	return &opts
 }
 
@@ -243,6 +253,35 @@ func (p *Project) checkShell() {
 	panic("No proper shell in container available.")
 }
 
+func (p *Project) setSourceDir() {
+	srcDir := filepath.Join(p.BaseDir, srcPath[p.Project])
+	stat, err := os.Stat(srcDir)
+	check(err, "Project "+p.Project+" source does not exist.")
+	if !stat.IsDir() {
+		panic("Source " + srcDir + "is not a directory")
+	}
+	p.SourceDir = srcDir
+}
+
+func (p *Project) printUsage() {
+	execCmd := "docker exec -it %s %s"
+	stopCmd := "docker stop %s"
+	rmCmd := "docker rm %s"
+	lsCmd := "docker ps -a"
+	stopallCmd := `docker stop $(docker ps -a -q)`
+	rmallCmd := `docker rm $(docker ps -a -q)`
+	logLoc := filepath.Join(p.Workdir, "log")
+	srcLoc := p.SourceDir
+	fmt.Println("Access container: " + fmt.Sprintf(execCmd, p.Container.ID[:12], shell[p.Shell]))
+	fmt.Println("Stop container: " + fmt.Sprintf(stopCmd, p.Container.ID[:12]))
+	fmt.Println("Remove container: " + fmt.Sprintf(rmCmd, p.Container.ID[:12]))
+	fmt.Println("List all containers: " + lsCmd)
+	fmt.Println("Stop all containers: " + stopallCmd)
+	fmt.Println("Remove all containers: " + rmallCmd)
+	fmt.Println("Log location: " + logLoc)
+	fmt.Println("Source location: " + srcLoc)
+}
+
 // ---End of tools---
 
 func (p *Project) createDockerClient() {
@@ -257,7 +296,7 @@ func (p *Project) createDockerClient() {
 	p.DockerClient.Client = cli
 }
 
-func (p *Project) getImageId() {
+func (p *Project) setImageId() {
 	cli, ctx := extractClient(p)
 	ilist, err := cli.ImageList(*ctx, types.ImageListOptions{})
 	check(err, "Get docker image list error.")
@@ -277,6 +316,78 @@ func (p *Project) getImageId() {
 			}
 		}
 	}
+	defer func() {
+		if p.Image.ID == "" {
+			panic("No proper Image found in this host.")
+		}
+	}()
+}
+
+func (p *Project) prepareHostConfig(init bool) *container.HostConfig {
+	if init {
+		return nil
+	}
+
+	var hostConfig container.HostConfig
+
+	var bindOptions mount.BindOptions
+	bindOptions.Propagation = mount.PropagationRPrivate
+
+	var logMount mount.Mount
+	logMount.Type = mount.TypeBind
+	logMount.Source = filepath.Join(p.Workdir, "log")
+	logMount.Target = `/var/log/deployer`
+	logMount.ReadOnly = false
+	logMount.BindOptions = &bindOptions
+	logbind := fmt.Sprintf("%s:%s", logMount.Source, logMount.Target)
+
+	var srcMount mount.Mount
+	srcMount.Type = mount.TypeBind
+	srcMount.Source = p.SourceDir
+	srcMount.Target = `/home/shinto/deployer`
+	srcMount.ReadOnly = false
+	srcMount.BindOptions = &bindOptions
+	srcbind := fmt.Sprintf("%s:%s", srcMount.Source, srcMount.Target)
+
+	var hostMount mount.Mount
+	hostMount.Type = mount.TypeBind
+	hostMount.Source = p.Workdir
+	hostMount.Target = `/home/shinto/host`
+	hostMount.ReadOnly = false
+	hostMount.BindOptions = &bindOptions
+	hostbind := fmt.Sprintf("%s:%s", hostMount.Source, hostMount.Target)
+
+	var passwdMount mount.Mount
+	passwdMount.Type = mount.TypeBind
+	passwdMount.Source = filepath.Join(p.Workdir, "passwd")
+	passwdMount.Target = pgfiles["passwd"]
+	passwdMount.ReadOnly = false
+	passwdMount.BindOptions = &bindOptions
+	passwdbind := fmt.Sprintf("%s:%s", passwdMount.Source, passwdMount.Target)
+
+	var groupMount mount.Mount
+	groupMount.Type = mount.TypeBind
+	groupMount.Source = filepath.Join(p.Workdir, "group")
+	groupMount.Target = pgfiles["group"]
+	groupMount.ReadOnly = false
+	groupMount.BindOptions = &bindOptions
+	groupbind := fmt.Sprintf("%s:%s", groupMount.Source, groupMount.Target)
+
+	hostConfig.Binds = []string{
+		logbind,
+		srcbind,
+		hostbind,
+		passwdbind,
+		groupbind}
+	hostConfig.AutoRemove = true
+	hostConfig.Privileged = p.Privilege
+	hostConfig.Mounts = []mount.Mount{
+		logMount,
+		srcMount,
+		hostMount,
+		passwdMount,
+		passwdMount}
+	return &hostConfig
 }
 
 // Prepare Config for creating the container
@@ -288,44 +399,46 @@ func (p *Project) prepareConfig(init bool) *container.Config {
 	if init {
 		return &config
 	}
+	// run as root, 0:0
+	config.User = `0:0`
 
+	// setup env
 	envStr := make([]string, 4)
-
 	if p.Root {
 		envStr = append(envStr, "C_FORCE_ROOT=1")
 	}
 	envStr = append(envStr, "no_proxy="+p.NoproxyHosts)
 	config.Env = envStr
-	fmt.Println(config.Env)
+
 	return &config
 }
 
 func (p *Project) createContainer(init bool) {
 	cli, ctx := extractClient(p)
 	config := p.prepareConfig(init)
-
-	if body, err := cli.ContainerCreate(*ctx, config, nil, nil, p.Cname); err != nil {
-		fmt.Println("Create container failed with error: " + err.Error())
-		panic("Create Container failed")
-	} else {
-		p.Container = body
-	}
-
+	hostConfig := p.prepareHostConfig(init)
+	body, err := cli.ContainerCreate(*ctx, config, hostConfig, nil, p.Cname)
+	check(err, "Create container failed.")
+	p.Container = body
 }
 
 func (p *Project) removeContainer() {
 	cli, ctx := extractClient(p)
 	var removeConfig types.ContainerRemoveOptions = types.ContainerRemoveOptions{false, false, true}
 	err := cli.ContainerRemove(*ctx, p.Container.ID, removeConfig)
-	check(err, "Remove container ID: "+p.Container.ID+" failed")
+	check(err, "Remove container: "+p.Container.ID+" failed")
 }
 
-func (p *Project) createTmpDir() {
-	currentPath, _ := os.Getwd()
-	workingPath := filepath.Join(currentPath, p.Workdir)
-	p.Workdir = workingPath
+func (p *Project) startContainer() {
+	cli, ctx := extractClient(p)
+	options := types.ContainerStartOptions{}
+	err := cli.ContainerStart(*ctx, p.Container.ID, options)
+	check(err, "Start container failed.")
+}
+
+func (p *Project) createWorkDir() {
 	for _, v := range subDirs {
-		os.MkdirAll(filepath.Join(workingPath, v), os.FileMode(0755))
+		os.MkdirAll(filepath.Join(p.Workdir, v), os.FileMode(0755))
 	}
 	// Change to workdir
 	os.Chdir(p.Workdir)
@@ -373,6 +486,25 @@ func (p *Project) touchRepoconfigJson() {
 	defer fd.Close()
 }
 
+func (p *Project) copyInstallJson() {
+	hostFd, err := os.Open(p.InstallJson)
+	check(err, "Open provided install_json.json failed.")
+	defer hostFd.Close()
+
+	installJsonFile := filepath.Join(p.Workdir, "install_json.json")
+	containerFd, err := os.Create(installJsonFile)
+	check(err, "Create install_json.json in workdir failed.")
+	defer func() {
+		err := containerFd.Close()
+		check(err, "Close install_json.json in workdir failed.")
+		containerFd.Close()
+	}()
+
+	_, err = io.Copy(containerFd, hostFd)
+	check(err, "Copy install_json.json failed.")
+	containerFd.Sync()
+}
+
 func (p *Project) prepare(opts *Options) {
 	oValue := reflect.ValueOf(*opts)
 	pValue := reflect.ValueOf(p).Elem()
@@ -387,19 +519,27 @@ func (p *Project) prepare(opts *Options) {
 	} else {
 		p.ImageRepository = imageRepository[p.Project]
 	}
+
+	// check install_json.json exist
+	_, err := os.Stat(p.InstallJson)
+	check(err, "Install json file "+p.InstallJson+" doesn't exist.")
 }
 
 func (p *Project) run() {
-	p.createTmpDir()
 	p.createDockerClient()
-	p.getImageId()
+	// set p.Image
+	p.setImageId()
+	p.setSourceDir()
+	p.createWorkDir()
 	p.createContainer(true)
 	p.checkShell()
 	p.rewriteUidGid()
 	p.removeContainer()
 	p.touchRepoconfigJson()
+	p.copyInstallJson()
 	p.createContainer(false)
-	fmt.Println(p.Shell)
+	p.startContainer()
+	p.printUsage()
 }
 
 func main() {
