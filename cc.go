@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -198,7 +199,18 @@ func getTempDir() (name string) {
 }
 
 func extractImageId(id string) string {
-	return strings.Split(id, ":")[1]
+	result := strings.Split(id, ":")
+
+	switch len(result) {
+	case 1:
+		return result[0]
+	case 2:
+		return result[1]
+	default:
+		check(errors.New("Image ID not recognized"),
+			"Image ID format not recognized.")
+		return ""
+	}
 }
 
 func (p *Project) copyFileFromContainer(from, to string, hook func() string) {
